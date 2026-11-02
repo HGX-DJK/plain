@@ -12,6 +12,8 @@
       </div>
 
       <n-data-table
+        flex-height
+        style="flex: 1; min-height: 0"
         :columns="columns"
         :data="filteredRoles"
         :loading="loading"

@@ -418,6 +418,11 @@ async function loadMap() {
         geometry: b.geometry as Record<string, unknown>,
         color: statusColor(b.status),
         label: `${b.name}（${b.code}）`,
+        // 点击建筑物弹出属性卡（与采集图层一致的交互）
+        popupTitle: b.name || b.code,
+        popupSubtitle: '建筑物',
+        popupBadges: b.status ? [b.status] : [],
+        properties: { code: b.code, name: b.name, status: b.status, usage: b.usage },
         onClick: () => selectFromMap(b.id),
       }))
     mapRef.value?.renderPlain(items, 'buildings')

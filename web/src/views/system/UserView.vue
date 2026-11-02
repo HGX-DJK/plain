@@ -34,6 +34,8 @@
       </div>
 
       <n-data-table
+        flex-height
+        style="flex: 1; min-height: 0"
         :columns="columns"
         :data="rows"
         :loading="loading"
@@ -73,7 +75,7 @@
           <n-form-item-gi label="手机号">
             <n-input v-model:value="form.phone" placeholder="选填" />
           </n-form-item-gi>
-          <n-form-item-gi label="邮箱">
+          <n-form-item-gi label="邮箱" path="email">
             <n-input v-model:value="form.email" placeholder="选填" />
           </n-form-item-gi>
           <n-form-item-gi label="角色" :span="2">
@@ -137,6 +139,7 @@ import { CreateOutline, KeyOutline, PersonAddOutline, TrashOutline } from '@vico
 import { systemApi, type RoleItem, type UserItem } from '@/api'
 import { useUserStore } from '@/store/user'
 import { dialogConfirm, toastError, toastSuccess } from '@/utils/naive'
+import { formatDateTime } from '@/utils/time'
 
 const store = useUserStore()
 const can = (code: string) => store.hasPerm(code)
@@ -205,8 +208,7 @@ function reload() {
 }
 
 function formatTime(t?: string | null) {
-  if (!t) return '-'
-  return t.replace('T', ' ').slice(0, 19)
+  return formatDateTime(t)
 }
 
 const columns = computed<DataTableColumns<UserItem>>(() => [

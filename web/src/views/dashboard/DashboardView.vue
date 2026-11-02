@@ -132,6 +132,7 @@ import {
 import { dashboardApi, type DashboardSummary } from '@/api'
 import { useUserStore } from '@/store/user'
 import { toastError } from '@/utils/naive'
+import { formatDateTime } from '@/utils/time'
 
 const router = useRouter()
 const store = useUserStore()
@@ -259,8 +260,7 @@ function statusType(s: string): 'success' | 'error' | 'warning' | 'info' | 'defa
   return 'default'
 }
 function formatTime(t?: string) {
-  if (!t) return '-'
-  return t.replace('T', ' ').slice(0, 16)
+  return formatDateTime(t, false)
 }
 
 function go(path: string) {

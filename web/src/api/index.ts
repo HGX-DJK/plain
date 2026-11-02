@@ -265,6 +265,10 @@ export interface FeatureMapGroup {
     geometry: Record<string, unknown>
     properties: Record<string, unknown>
   }>
+  /** 本次返回的要素条数 */
+  returned?: number
+  /** 该图层还有更多数据未返回（按视野/限额截断） */
+  truncated?: boolean
 }
 export const featureApi = {
   list: (params: Record<string, unknown>) =>
@@ -275,9 +279,20 @@ export const featureApi = {
     service.put(`/v1/features/${id}`, payload) as Promise<FeatureItem>,
   remove: (id: number) => service.delete(`/v1/features/${id}`),
   batchRemove: (ids: number[]) => service.post('/v1/features/batch-delete', { ids }),
-  map: (moduleIds: number[], limit = 5000) =>
+  /**
+   * 地图渲染数据：bbox 为当前视野经纬度包围盒，传了只取视野内要素；
+   * perModule 为单模块取数上限（后端还会按总量/模块数摊薄）。
+   */
+  map: (
+    moduleIds: number[],
+    opts: { bbox?: [number, number, number, number]; perModule?: number } = {},
+  ) =>
     service.get('/v1/features/map', {
-      params: { module_ids: moduleIds.join(','), limit },
+      params: {
+        module_ids: moduleIds.join(','),
+        bbox: opts.bbox ? opts.bbox.join(',') : undefined,
+        per_module: opts.perModule,
+      },
     }) as Promise<FeatureMapGroup[]>,
   stats: () => service.get('/v1/features/stats'),
   blank: (moduleId: number) =>

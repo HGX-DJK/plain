@@ -25,12 +25,17 @@
         </n-button>
       </div>
 
+      <!-- flex-height + flex:1：表格撑满卡片剩余高度，行数多时由表格内部滚动，
+           表头固定在上方、分页条常驻底部，20/50 条每页都不会把页面顶出窗口 -->
       <n-data-table
+        flex-height
+        style="flex: 1; min-height: 0"
         :columns="columns"
         :data="rows"
         :loading="loading"
         :pagination="pagination"
         remote
+        :scroll-x="SCROLL_X"
         :row-key="(r: InfoModule) => r.id"
       />
     </div>
@@ -208,32 +213,52 @@ function reload() {
   load()
 }
 
+/**
+ * 列宽合计：真实基础数据导入后，模块编码最长 25 字符（BM_POI_BUSINESS_RESIDENCE），
+ * 编码列必须给到 220px 才不会折行；总宽超过内容区时由表格自身的横向滚动条承接，
+ * 因此把同一份宽度声明同时用作 scroll-x，避免表格顶出卡片。
+ */
+const COL_WIDTHS = {
+  name: 170,
+  code: 220,
+  geom_type: 80,
+  category: 92,
+  color: 70,
+  layer_order: 56,
+  fields: 56,
+  feature_count: 80,
+  is_active: 76,
+  editable: 80,
+  actions: 140,
+}
+const SCROLL_X = Object.values(COL_WIDTHS).reduce((a, b) => a + b, 0)
+
 const columns = computed<DataTableColumns<InfoModule>>(() => [
-  { title: '名称', key: 'name', minWidth: 140 },
-  { title: '编码', key: 'code', width: 110 },
+  { title: '名称', key: 'name', minWidth: COL_WIDTHS.name, ellipsis: { tooltip: true } },
+  { title: '编码', key: 'code', width: COL_WIDTHS.code, ellipsis: { tooltip: true } },
   {
     title: '空间类型',
     key: 'geom_type',
-    width: 90,
+    width: COL_WIDTHS.geom_type,
     render: (r) => h(NTag, { size: 'small', type: 'info' }, { default: () => GEOM_LABELS[r.geom_type] ?? r.geom_type }),
   },
-  { title: '分类', key: 'category', width: 100, render: (r) => r.category || '-' },
+  { title: '分类', key: 'category', width: COL_WIDTHS.category, render: (r) => r.category || '-' },
   {
     title: '颜色',
     key: 'color',
-    width: 70,
+    width: COL_WIDTHS.color,
     render: (r) =>
       h('span', {
         style: `display:inline-block;width:16px;height:16px;border-radius:4px;background:${r.color};vertical-align:middle`,
       }),
   },
-  { title: '顺序', key: 'layer_order', width: 60 },
-  { title: '字段', key: 'fields', width: 60, render: (r) => r.fields?.length ?? 0 },
-  { title: '数据量', key: 'feature_count', width: 80, render: (r) => r.feature_count ?? 0 },
+  { title: '顺序', key: 'layer_order', width: COL_WIDTHS.layer_order },
+  { title: '字段', key: 'fields', width: COL_WIDTHS.fields, render: (r) => r.fields?.length ?? 0 },
+  { title: '数据量', key: 'feature_count', width: COL_WIDTHS.feature_count, render: (r) => r.feature_count ?? 0 },
   {
     title: '状态',
     key: 'is_active',
-    width: 90,
+    width: COL_WIDTHS.is_active,
     render: (r) =>
       r.is_active
         ? h(NTag, { size: 'small', type: 'success' }, { default: () => '启用' })
@@ -242,13 +267,13 @@ const columns = computed<DataTableColumns<InfoModule>>(() => [
   {
     title: '锁定',
     key: 'editable',
-    width: 80,
+    width: COL_WIDTHS.editable,
     render: (r) => (r.editable ? '-' : h(NTag, { size: 'small', type: 'warning' }, { default: () => '已锁定' })),
   },
   {
     title: '操作',
     key: 'actions',
-    width: 150,
+    width: COL_WIDTHS.actions,
     render: (r) =>
       h('div', { style: 'display:flex;gap:6px' }, [
         can('module:update')

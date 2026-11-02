@@ -34,6 +34,8 @@
       </div>
 
       <n-data-table
+        flex-height
+        style="flex: 1; min-height: 0"
         :columns="columns"
         :data="rows"
         :loading="loading"
@@ -78,7 +80,7 @@
           <n-form-item-gi label="联系电话">
             <n-input v-model:value="form.phone" placeholder="手机或座机" />
           </n-form-item-gi>
-          <n-form-item-gi label="电子邮箱">
+          <n-form-item-gi label="电子邮箱" path="email">
             <n-input v-model:value="form.email" placeholder="选填" />
           </n-form-item-gi>
         </n-grid>

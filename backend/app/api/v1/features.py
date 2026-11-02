@@ -1,10 +1,12 @@
 """采集要素：空间信息 + 属性信息。"""
+import json
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query, Request
 from geoalchemy2 import Geography
 from sqlalchemy import func
 from sqlalchemy import cast
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -36,6 +38,58 @@ def _geom_exprs():
         func.ST_Area(_geo_cast(Feature.geometry)).label("area_m2"),
         func.ST_Length(_geo_cast(Feature.geometry)).label("length_m"),
     )
+
+
+# 地图取数：几何输出精度（度，6 位约等于 0.1m）与业务库 SRID
+_GEOJSON_PRECISION = 6
+_SRID = settings.spatial_srid
+
+
+def _parse_module_ids(raw: str | None) -> list[int] | None:
+    """逗号分隔的模块 id；None 表示不指定（由调用方按启用模块处理）。"""
+    if raw is None or not raw.strip():
+        return None
+    return [int(i) for i in raw.split(",") if i.strip().isdigit()]
+
+
+def _parse_bbox(raw: str | None) -> tuple[float, float, float, float] | None:
+    """解析视野包围盒并校验单位是否为「度」。
+
+    地图投影若被误当成 Web 墨卡托（数值可达千万）传给 PostGIS，
+    ST_MakeEnvelope 会直接报错或查不到数据，这里提前给出明确提示。
+    """
+    if raw is None or not raw.strip():
+        return None
+    parts = [p for p in raw.split(",") if p.strip()]
+    if len(parts) != 4:
+        raise AppError("bbox 需为 minx,miny,maxx,maxy 四个数值")
+    try:
+        minx, miny, maxx, maxy = (float(p) for p in parts)
+    except ValueError as exc:
+        raise AppError("bbox 需为 minx,miny,maxx,maxy 四个数值") from exc
+    if max(abs(minx), abs(maxx)) > 180 or max(abs(miny), abs(maxy)) > 90:
+        raise AppError("bbox 数值超出经纬度范围，请确认地图坐标系")
+    if minx > maxx:
+        minx, maxx = maxx, minx
+    if miny > maxy:
+        miny, maxy = maxy, miny
+    return minx, miny, maxx, maxy
+
+
+def _auto_per_module(env: tuple[float, float, float, float] | None) -> int:
+    """未指定单模块上限时，按视野跨度（度）粗略换算缩放级别给出取值。"""
+    if env is None:
+        return 300
+    span = max(env[2] - env[0], env[3] - env[1])
+    if span >= 1.0:
+        return 100
+    if span >= 0.3:
+        return 200
+    if span >= 0.08:
+        return 400
+    if span >= 0.02:
+        return 800
+    return 1500
 
 
 def _build_out(
@@ -170,48 +224,131 @@ def stats(db: Session = Depends(get_db), _: User = Depends(guard_view)):
     )
 
 
-@router.get("/map", summary="地图渲染数据（按模块聚合）")
+@router.get("/map", summary="地图渲染数据（按模块聚合，支持按视野取数）")
 def map_features(
-    module_ids: str | None = Query(None, description="逗号分隔的模块 id"),
-    limit: int = Query(2000, ge=1, le=20000),
+    module_ids: str | None = Query(None, description="逗号分隔的模块 id；不传则取全部启用的信息模块"),
+    bbox: str | None = Query(
+        None,
+        description="地图视野范围 minx,miny,maxx,maxy（与业务库同为单位度）；传入后只取视野内要素",
+    ),
+    per_module: int | None = Query(
+        None,
+        ge=1,
+        le=20000,
+        description="单个模块的取数上限；不传则按视野范围自动取值，且会按 max_total / 模块数 摊薄",
+    ),
+    max_total: int = Query(6000, ge=100, le=60000, description="单次响应的要素总量上限（在各模块间均分）"),
     db: Session = Depends(get_db),
     _: User = Depends(guard_view),
 ):
-    q = db.query(Feature, *_geom_exprs())
-    if module_ids:
-        ids = [int(i) for i in module_ids.split(",") if i.strip().isdigit()]
-        if ids:
-            q = q.filter(Feature.module_id.in_(ids))
-    rows = q.order_by(Feature.id).limit(limit).all()
+    """按视野取数 + 逐模块限额。
+
+    历史实现是「全表 order by id 取前 limit 条」：真实数据入库后 col_feature 有
+    47 万余条（点 39.6 万 / 面 7.9 万），住宅小区、公司企业这类大模块按 id 排在最前，
+    独自吃满整个 limit 额度，其余模块（尤其点位）一条都取不到，界面上就是看不到点位。
+    现在改为：
+      1. 逐模块 CROSS JOIN LATERAL ... LIMIT，模块之间互不挤占；
+      2. 传 bbox 时用 f.geometry && ST_MakeEnvelope(...) 过滤，走 idx_col_feature_geometry
+         的 GiST 索引，只搬运视野内的要素；
+      3. 单模块上限还会按 max_total / 模块数 再摊薄一次，保证响应体不会随图层数线性膨胀。
+    每个模块多取 1 条用于判断「视野内还有更多」，返回 truncated 供前端提示。
+    """
+    env = _parse_bbox(bbox)
+    ids = _parse_module_ids(module_ids)
+    if ids is not None and not ids:
+        return ok([])
+
+    # 两处查询都以 meta_info_module 单表为 FROM，条件用不带限定的列名，内层子查询才能引用
+    module_where = "id = ANY(:ids)" if ids is not None else "is_active = TRUE"
+    count_row = db.execute(
+        text(f"SELECT count(*) FROM meta_info_module m WHERE {module_where}"),  # noqa: S608
+        {"ids": ids} if ids is not None else {},
+    ).scalar()
+    module_count = int(count_row or 0)
+    if not module_count:
+        return ok([])
+
+    # 视野越大、模块越多，单模块取值越收敛；再叠加一个总量摊薄，避免整屏图层各拿满额度
+    per_module_limit = per_module if per_module is not None else _auto_per_module(env)
+    per_module_limit = max(
+        1, min(per_module_limit, max(10, max_total // module_count), max_total)
+    )
+
+    bbox_sql = ""
+    if env:
+        bbox_sql = f"AND f.geometry && ST_MakeEnvelope(:minx, :miny, :maxx, :maxy, {_SRID})"
+    sql = text(f"""
+        SELECT m.id AS module_id, m.name AS module_name, m.geom_type AS geom_type, m.color AS color,
+               g.id AS feature_id, g.code AS feature_code, g.name AS feature_name,
+               g.status AS feature_status, g.feature_props AS feature_props,
+               g.feature_geom AS feature_geom
+          FROM (
+                SELECT id, name, geom_type, color, layer_order
+                  FROM meta_info_module
+                 WHERE {module_where}
+               ) m
+          CROSS JOIN LATERAL (
+                SELECT f.id,
+                       f.code,
+                       f.name,
+                       f.status,
+                       f.properties::text AS feature_props,
+                       ST_AsGeoJSON(f.geometry, {_GEOJSON_PRECISION}) AS feature_geom
+                  FROM col_feature f
+                 WHERE f.module_id = m.id
+                   {bbox_sql}
+                 LIMIT :lim
+               ) g
+         ORDER BY m.layer_order, m.id, g.id
+    """)
+    params: dict[str, Any] = {"lim": per_module_limit + 1}
+    if ids is not None:
+        params["ids"] = ids
+    if env:
+        params.update(minx=env[0], miny=env[1], maxx=env[2], maxy=env[3])
 
     grouped: dict[int, dict] = {}
-    for f, gj, cj, area, length in rows:
+    for row in db.execute(sql, params):
         bucket = grouped.setdefault(
-            f.module_id,
+            row.module_id,
             {
-                "module_id": f.module_id,
-                "module_name": f.module.name if f.module else None,
-                "geom_type": f.module.geom_type if f.module else None,
-                "color": f.module.color if f.module else "#2d8cf0",
+                "module_id": row.module_id,
+                "module_name": row.module_name,
+                "geom_type": row.geom_type,
+                "color": row.color or "#2d8cf0",
                 "features": [],
+                "returned": 0,
+                "truncated": False,
             },
         )
+        if len(bucket["features"]) >= per_module_limit:
+            # 多取的那一条说明视野内/该模块还有更多数据
+            bucket["truncated"] = True
+            continue
+        props: dict = {}
+        if row.feature_props:
+            try:
+                props = json.loads(row.feature_props) or {}
+            except ValueError:
+                props = {}
         bucket["features"].append(
             FeatureMapOut(
-                id=f.id,
-                module_id=f.module_id,
-                code=f.code,
-                name=f.name,
-                geometry=geom_svc.loads_geojson(gj),
+                id=row.feature_id,
+                module_id=row.module_id,
+                code=row.feature_code,
+                name=row.feature_name,
+                geometry=geom_svc.loads_geojson(row.feature_geom),
                 properties={
-                    "id": f.id,
-                    "name": f.name,
-                    "code": f.code,
-                    "status": f.status,
-                    **(f.properties or {}),
+                    "id": row.feature_id,
+                    "name": row.feature_name,
+                    "code": row.feature_code,
+                    "status": row.feature_status,
+                    **props,
                 },
             ).model_dump()
         )
+    for bucket in grouped.values():
+        bucket["returned"] = len(bucket["features"])
     return ok(list(grouped.values()))
 
 

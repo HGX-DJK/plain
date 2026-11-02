@@ -26,6 +26,8 @@
       </div>
 
       <n-data-table
+        flex-height
+        style="flex: 1; min-height: 0"
         :columns="columns"
         :data="rows"
         :loading="loading"
@@ -190,6 +192,7 @@ import {
 import MapView from '@/components/map/MapView.vue'
 import { useUserStore } from '@/store/user'
 import { dialogConfirm, toastError, toastSuccess } from '@/utils/naive'
+import { formatDateTime } from '@/utils/time'
 
 const store = useUserStore()
 const can = (code: string) => store.hasPerm(code)
@@ -263,8 +266,7 @@ function reload() {
 }
 
 function formatTime(t?: string | null) {
-  if (!t) return '-'
-  return t.replace('T', ' ').slice(0, 19)
+  return formatDateTime(t)
 }
 
 const columns = computed<DataTableColumns<CompareTask>>(() => [

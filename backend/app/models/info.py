@@ -9,6 +9,7 @@ from sqlalchemy import (
     Boolean,
     Float,
     ForeignKey,
+    Index,
     Integer,
     JSON,
     String,
@@ -91,6 +92,10 @@ class Feature(Base, IdMixin, TimestampMixin):
     __tablename__ = "col_feature"
     __table_args__ = (
         UniqueConstraint("code", name="uq_col_feature_code"),
+        # 地图按模块聚合取数、列表按模块过滤都要先按 module_id 收窄，
+        # 没有这个索引时每次查询都会全表扫（col_feature 已超 47 万行）。
+        # 空间索引 idx_col_feature_geometry 由 GeoAlchemy2 的 Geometry(spatial_index=True) 自动建。
+        Index("idx_col_feature_module", "module_id"),
     )
 
     module_id: Mapped[int] = mapped_column(

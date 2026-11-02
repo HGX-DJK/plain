@@ -2,18 +2,23 @@
   <div class="page">
     <div class="map-page">
       <div class="side-panel">
-      <div class="panel-section">
-        <div class="section-title">采集目标</div>
-        <n-select
-          v-model:value="selectedModuleId"
-          :options="moduleOptions"
-          placeholder="选择信息模块"
-          @update:value="onModuleChange"
-        />
-        <div v-if="selectedModule" class="module-meta">
-          <span class="color-dot" :style="{ background: selectedModule.color }" />
-          <n-tag size="small" type="info">{{ GEOM_LABELS[selectedModule.geom_type] }}</n-tag>
-          <span class="module-code">{{ selectedModule.code }}</span>
+      <div class="panel-section target-section">
+        <div class="target-row">
+          <div class="section-title target-title">采集目标</div>
+          <n-select
+            v-model:value="selectedModuleId"
+            :options="moduleOptions"
+            :title="selectedModule ? `${selectedModule.name}（${selectedModule.code}）` : ''"
+            placeholder="选择信息模块"
+            size="small"
+            @update:value="onModuleChange"
+          />
+          <template v-if="selectedModule">
+            <span class="color-dot" :style="{ background: selectedModule.color }" />
+            <n-tag size="small" type="info" :bordered="false" :title="`几何类型：${GEOM_LABELS[selectedModule.geom_type]}`">
+              {{ GEOM_LABELS[selectedModule.geom_type] }}
+            </n-tag>
+          </template>
         </div>
         <div class="draw-btns">
           <n-button
@@ -38,18 +43,39 @@
         </div>
       </div>
 
-      <div class="panel-section">
-        <div class="section-title">图层</div>
-        <div v-if="!modules.length" class="empty-hint">暂无模块，请先在「信息模块管理」中创建</div>
-        <div v-for="m in modules" :key="m.id" class="layer-row" @click="selectedModuleId = m.id; onModuleChange()">
-          <n-checkbox
-            :checked="visibleIds.includes(m.id)"
-            @update:checked="toggleVisible(m.id, $event)"
-            @click.stop
+      <div class="panel-section layer-section">
+        <div class="section-title">
+          图层
+          <span v-if="layerTotalCount" class="list-count">显示 {{ layerCheckedCount }}/{{ layerTotalCount }}</span>
+        </div>
+        <div v-if="modules.length" class="layer-toolbar">
+          <n-input
+            v-model:value="layerKeyword"
+            size="small"
+            placeholder="搜索图层名称/编码"
+            clearable
           />
-          <span class="color-dot" :style="{ background: m.color }" />
-          <span class="layer-name">{{ m.name }}</span>
-          <n-tag size="tiny" :bordered="false">{{ GEOM_LABELS[m.geom_type] }}</n-tag>
+          <n-checkbox
+            :checked="allLayersChecked"
+            :indeterminate="someLayersChecked"
+            @update:checked="toggleAllVisible"
+          >
+            全选
+          </n-checkbox>
+        </div>
+        <div v-if="!modules.length" class="empty-hint">暂无模块，请先在「信息模块管理」中创建</div>
+        <div v-else class="layer-list">
+          <div v-for="m in filteredModules" :key="m.id" class="layer-row" @click="selectedModuleId = m.id; onModuleChange()">
+            <n-checkbox
+              :checked="visibleIds.includes(m.id)"
+              @update:checked="toggleVisible(m.id, $event)"
+              @click.stop
+            />
+            <span class="color-dot" :style="{ background: m.color }" />
+            <span class="layer-name">{{ m.name }}</span>
+            <n-tag size="tiny" :bordered="false">{{ GEOM_LABELS[m.geom_type] }}</n-tag>
+          </div>
+          <div v-if="!filteredModules.length" class="empty-hint">没有匹配的图层</div>
         </div>
       </div>
 
@@ -62,18 +88,20 @@
           <n-input v-model:value="listKeyword" size="small" placeholder="搜索名称/编号" clearable @keyup.enter="reloadList" />
           <n-button size="small" @click="reloadList">查询</n-button>
         </div>
-        <n-data-table
-          v-if="selectedModule"
-          :columns="listColumns"
-          :data="listRows"
-          :loading="listLoading"
-          size="small"
-          :pagination="listPagination"
-          remote
-          :row-key="(r: FeatureItem) => r.id"
-          :row-props="rowProps"
-        />
-        <n-empty v-else description="请先选择信息模块" size="small" style="margin-top: 40px" />
+        <div class="list-body">
+          <n-data-table
+            v-if="selectedModule"
+            :columns="listColumns"
+            :data="listRows"
+            :loading="listLoading"
+            size="small"
+            :pagination="listPagination"
+            remote
+            :row-key="(r: FeatureItem) => r.id"
+            :row-props="rowProps"
+          />
+          <n-empty v-else description="请先选择信息模块" size="small" style="margin-top: 40px" />
+        </div>
       </div>
     </div>
 
@@ -83,8 +111,15 @@
         :center="mapCenter"
         :zoom="mapZoom"
         :max-zoom="mapMaxZoom"
+        :field-labels="fieldLabels"
         :on-feature-click="onMapFeatureClick"
+        :on-view-change="onViewChange"
       />
+      <div class="map-status" :class="{ 'is-loading': mapLoading }">
+        <span class="status-dot" />
+        <span class="status-text">{{ mapStatus }}</span>
+        <n-button text size="tiny" :disabled="mapLoading" @click="loadGroups()">重新取数</n-button>
+      </div>
       <div v-if="shapingNew" class="shape-bar">
         <div class="shape-info">
           <span class="shape-badge">面要素</span>
@@ -196,11 +231,20 @@
 </template>
 
 <script setup lang="ts">
-import { computed, h, onMounted, reactive, ref, watch } from 'vue'
+import { computed, h, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { NButton, NIcon, type DataTableColumns, type FormInst, type FormRules } from 'naive-ui'
 import { CreateOutline, LocateOutline, PencilOutline, ShapesOutline, TrashOutline } from '@vicons/ionicons5'
-import { featureApi, moduleApi, type FeatureItem, type FieldDef, type InfoModule, type ModuleBrief } from '@/api'
+import {
+  featureApi,
+  moduleApi,
+  type FeatureItem,
+  type FeatureMapGroup,
+  type FieldDef,
+  type InfoModule,
+  type ModuleBrief,
+} from '@/api'
 import MapView from '@/components/map/MapView.vue'
+import type { MapViewport } from '@/components/map/viewport'
 import { useUserStore } from '@/store/user'
 import { dialogConfirm, toastError, toastSuccess } from '@/utils/naive'
 
@@ -224,12 +268,53 @@ const modules = ref<ModuleBrief[]>([])
 const selectedModuleId = ref<number | null>(null)
 const selectedModuleFull = ref<InfoModule | null>(null)
 const visibleIds = ref<number[]>([])
-const groups = ref<Array<{ module_id: number; geom_type: string; color: string; features: Array<{ id: number; geometry: Record<string, unknown>; properties: Record<string, unknown> }> }>>([])
+const groups = ref<FeatureMapGroup[]>([])
+/** 各模块字段定义：地图属性卡里把属性 key 显示成中文字段名 */
+const fieldLabels = ref<Record<number, Record<string, string>>>({})
 
 const moduleOptions = computed(() =>
   modules.value.map((m) => ({ label: `${m.name}（${m.code}）`, value: m.id })),
 )
 const selectedModule = computed(() => modules.value.find((m) => m.id === selectedModuleId.value) ?? null)
+
+// ---------------- 图层搜索与全选 ----------------
+const layerKeyword = ref('')
+const filteredModules = computed(() => {
+  const kw = layerKeyword.value.trim().toLowerCase()
+  if (!kw) return modules.value
+  return modules.value.filter(
+    (m) => m.name.toLowerCase().includes(kw) || m.code.toLowerCase().includes(kw),
+  )
+})
+/** 图层标题上的计数：已勾选显示 / 全部采集图层 */
+const layerCheckedCount = computed(() => visibleIds.value.length)
+const layerTotalCount = computed(() => modules.value.length)
+const allLayersChecked = computed(() => {
+  if (!filteredModules.value.length) return false
+  return filteredModules.value.every((m) => visibleIds.value.includes(m.id))
+})
+/** 当前筛选结果中部分勾选时，全选框显示为半选态 */
+const someLayersChecked = computed(() => {
+  const total = filteredModules.value.length
+  const checked = filteredModules.value.filter((m) => visibleIds.value.includes(m.id)).length
+  return checked > 0 && checked < total
+})
+
+/** 全选/取消全选：只作用于当前搜索过滤后的采集图层，新出现的图层按需补取 */
+function toggleAllVisible(checked: boolean) {
+  const ids = filteredModules.value.map((m) => m.id)
+  if (checked) {
+    const before = visibleIds.value
+    visibleIds.value = Array.from(new Set([...before, ...ids]))
+    const missing = visibleIds.value.filter((id) => !before.includes(id))
+    if (missing.length) loadGroups(missing, true)
+    else renderVisible()
+  } else {
+    visibleIds.value = visibleIds.value.filter((id) => !ids.includes(id))
+    groups.value = groups.value.filter((g) => visibleIds.value.includes(g.module_id))
+    renderVisible()
+  }
+}
 
 async function loadModules() {
   try {
@@ -241,6 +326,21 @@ async function loadModules() {
     await loadFullModule()
   } catch (e) {
     toastError((e as Error).message || '加载模块失败')
+  }
+}
+
+/** 拉取各模块字段定义，供地图属性卡把属性 key 显示成中文字段名；失败时回退为原始 key */
+async function loadFieldLabels() {
+  try {
+    const res = await moduleApi.list({ page: 1, page_size: 500 })
+    const labels: Record<number, Record<string, string>> = {}
+    for (const m of res.items ?? []) {
+      if (!m.fields?.length) continue
+      labels[m.id] = Object.fromEntries(m.fields.map((f) => [f.key, f.label]))
+    }
+    fieldLabels.value = labels
+  } catch {
+    fieldLabels.value = {}
   }
 }
 
@@ -257,18 +357,78 @@ async function loadFullModule() {
   }
 }
 
-async function loadGroups() {
-  if (!modules.value.length) {
+async function loadGroups(ids?: number[], merge = false) {
+  const targets = ids ?? visibleIds.value
+  if (!targets.length) {
     groups.value = []
+    mapRef.value?.renderGroups([])
     return
   }
+  const view = mapRef.value?.getViewport() ?? null
+  mapLoading.value = true
   try {
-    groups.value = await featureApi.map(modules.value.map((m) => m.id))
+    // 按视野取数：col_feature 已 47 万余条，全量取会让大模块吃满额度、点位一条不剩
+    const opts: { bbox?: [number, number, number, number]; perModule?: number } = {}
+    if (view) {
+      opts.bbox = view.bbox
+      opts.perModule = perModuleByZoom(view.zoom)
+    }
+    const loaded = await featureApi.map(targets, opts)
+    if (merge) {
+      // 保持「模块列表」顺序作为图层压盖顺序，只替换本次取到的模块
+      const byId = new Map(groups.value.map((g) => [g.module_id, g]))
+      for (const g of loaded) byId.set(g.module_id, g)
+      groups.value = modules.value
+        .map((m) => byId.get(m.id))
+        .filter((g): g is FeatureMapGroup => !!g)
+    } else {
+      groups.value = loaded
+    }
     renderVisible()
   } catch (e) {
     toastError((e as Error).message || '加载地图数据失败')
+  } finally {
+    mapLoading.value = false
   }
 }
+
+/** 缩放级别越小视野越大，单模块取数上限相应收敛，避免一次拖图搬回几万个图形 */
+function perModuleByZoom(zoom: number): number {
+  if (zoom >= 17) return 1500
+  if (zoom >= 15) return 600
+  if (zoom >= 13) return 250
+  if (zoom >= 11) return 120
+  return 60
+}
+
+const mapLoading = ref(false)
+const loadedCount = computed(() => groups.value.reduce((n, g) => n + (g.features?.length ?? 0), 0))
+/** 地图左上角的状态条：视野内取了多少条、是否有图层被截断 */
+const mapStatus = computed(() => {
+  if (mapLoading.value) return '视野取数中…'
+  if (!visibleIds.value.length) return '未勾选显示图层'
+  if (!groups.value.length) return '当前视野内暂无采集数据'
+  const cut = groups.value.filter((g) => g.truncated).length
+  const base = `视野内 ${loadedCount.value} 条 · ${groups.value.length} 个图层`
+  // 截断是因为单次响应有总量上限（按图层均分），缩小视野或减少勾选即可看全
+  return cut ? `${base} · ${cut} 个图层数据较多，可放大地图或只勾选需要的图层` : base
+})
+
+/** 视野稳定后按新范围重新取数；拖拽/滚轮过程中不重复请求 */
+let viewTimer: ReturnType<typeof setTimeout> | null = null
+function onViewChange(_view: MapViewport) {
+  if (viewTimer) clearTimeout(viewTimer)
+  viewTimer = setTimeout(() => {
+    viewTimer = null
+    // 绘制或形状编辑进行中不重刷图层：重刷会替换正在编辑的图形对象，顶点手柄会失效
+    if (drawing.value || shapingBusy.value || shapingNew.value || editingShapeId.value) return
+    loadGroups()
+  }, 420)
+}
+onBeforeUnmount(() => {
+  if (viewTimer) clearTimeout(viewTimer)
+  viewTimer = null
+})
 
 function renderVisible() {
   const visible = groups.value.filter((g) => visibleIds.value.includes(g.module_id))
@@ -277,11 +437,15 @@ function renderVisible() {
 
 function toggleVisible(moduleId: number, checked: boolean) {
   if (checked) {
-    if (!visibleIds.value.includes(moduleId)) visibleIds.value.push(moduleId)
+    if (visibleIds.value.includes(moduleId)) return
+    visibleIds.value.push(moduleId)
+    // 只补取这一个图层，避免为了一层重刷全部图层
+    loadGroups([moduleId], true)
   } else {
     visibleIds.value = visibleIds.value.filter((id) => id !== moduleId)
+    groups.value = groups.value.filter((g) => g.module_id !== moduleId)
+    renderVisible()
   }
-  renderVisible()
 }
 
 function onModuleChange() {
@@ -469,12 +633,15 @@ const listColumns = computed<DataTableColumns<FeatureItem>>(() => [
     title: '状态',
     key: 'status',
     width: 58,
-    render: (r) => (r.status === 'verified' ? '已核实' : r.status || '草稿'),
+    render: (r) => (r.status === 'verified' ? '已核实' : r.status === 'draft' || !r.status ? '草稿' : r.status),
   },
   {
     title: '操作',
     key: 'actions',
     width: 148,
+    // 标题与下方操作按钮统一右对齐
+    align: 'right',
+    titleAlign: 'right',
     render: (r) =>
       h('div', { style: 'display:flex;gap:2px;justify-content:flex-end' }, [
         can('feature:update')
@@ -712,6 +879,9 @@ async function saveFeature() {
   }
   if (editingFeature.value) {
     payload.code = editingFeature.value.code ?? undefined
+  } else {
+    // 新建时允许自定义编号；留空则由后端自动生成
+    payload.code = form.code.trim() || undefined
   }
   saving.value = true
   try {
@@ -779,20 +949,63 @@ function removeFeature(row: FeatureItem) {
 // ---------------- 初始化 ----------------
 onMounted(async () => {
   await loadModules()
-  await Promise.all([loadGroups(), loadList()])
+  await Promise.all([loadGroups(), loadList(), loadFieldLabels()])
 })
 </script>
 
 <style scoped>
-.module-meta {
+/* 视野取数状态条：贴在地图左上角，说明当前视野内加载了多少、是否有图层被截断 */
+.map-status {
+  position: absolute;
+  left: 14px;
+  top: 14px;
+  z-index: 10;
   display: flex;
   align-items: center;
   gap: 8px;
-  margin-top: 8px;
-}
-.module-code {
-  color: #999;
+  max-width: min(460px, 72%);
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.92);
+  box-shadow: var(--shadow-card);
+  color: var(--ink-600);
   font-size: 12px;
+  line-height: 1.6;
+}
+.map-status .status-dot {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #18a058;
+}
+.map-status.is-loading .status-dot {
+  background: #f0a020;
+}
+.map-status .status-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 采集目标：标题 + 模块选择 + 几何类型合并为一行 */
+.target-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.target-title {
+  flex: none;
+  white-space: nowrap;
+}
+.target-row :deep(.n-select) {
+  flex: 1;
+  min-width: 0;
+}
+.target-row .color-dot {
+  width: 10px;
+  height: 10px;
 }
 .color-dot {
   display: inline-block;
@@ -806,6 +1019,26 @@ onMounted(async () => {
   display: flex;
   flex-direction: column;
   gap: 8px;
+}
+.layer-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: none;
+}
+.layer-toolbar :deep(.n-input) {
+  flex: 1;
+  min-width: 0;
+}
+.layer-toolbar :deep(.n-checkbox__label) {
+  font-size: 12px;
+  padding-left: 6px;
+}
+.layer-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding-right: 2px;
 }
 .layer-row {
   display: flex;
@@ -829,10 +1062,33 @@ onMounted(async () => {
   font-size: 12px;
 }
 .list-section {
-  flex: 1;
+  flex: 1 1 auto;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   overflow: hidden;
+}
+/* 侧栏自身不整体滚动：图层区与要素列表各自内部滚动，
+   避免模块变多时图层撑满整页、把要素列表挤成 0 高度 */
+.side-panel {
+  overflow: hidden;
+}
+.target-section {
+  flex: none;
+}
+.layer-section {
+  flex: none;
+  max-height: min(320px, 38vh);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  overflow: hidden;
+}
+.list-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding-right: 2px;
 }
 .list-count {
   color: #999;

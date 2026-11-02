@@ -1,6 +1,9 @@
 <template>
   <div class="map-view-wrap">
     <div ref="mapEl" class="map-view"></div>
+    <Transition name="map-popup">
+      <FeaturePopup v-if="popup" v-bind="popup" @close="closePopup" />
+    </Transition>
     <div v-if="!hasBaseMap" class="map-tip">
       <span class="map-tip-title">底图服务未就绪</span>
       <span class="map-tip-desc">当前无法加载地图底图，请联系系统管理员</span>
@@ -17,13 +20,33 @@ import type * as Maptalks from 'maptalks'
 import { ispace } from '@/utils/ispace'
 import { mapTileConfig } from '@/utils/mapConfig'
 import type { InfoModule } from '@/api'
+import FeaturePopup from './FeaturePopup.vue'
+import { coordHint, popupRows, type PopupData, type PopupPlacement } from './featurePopup'
+import { toLonLatBbox, type MapViewport } from './viewport'
 
-const props = defineProps<{
-  center?: [number, number]
-  zoom?: number
-  maxZoom?: number
-  onFeatureClick?: (featureId: number, moduleId: number) => void
-}>()
+/**
+ * Boolean 属性必须显式给默认值：Vue 对布尔 prop 做 casting，未传值时会被转成 false，
+ * 之前 featurePopup 缺省会走到 `props.featurePopup === false` 这条“禁用弹窗”分支，
+ * 导致所有地图要素点击都不弹属性卡。
+ */
+const props = withDefaults(
+  defineProps<{
+    center?: [number, number]
+    zoom?: number
+    maxZoom?: number
+    onFeatureClick?: (featureId: number, moduleId: number) => void
+    /** 视野停止变化后回调，采集图层按视野取数用（不传则不监听） */
+    onViewChange?: (viewport: MapViewport) => void
+    /** 模块字段定义（module_id → { 属性key: 中文字段名 }），用于弹窗展示可读字段名 */
+    fieldLabels?: Record<number, Record<string, string>>
+    /** 点击要素时是否弹出属性卡（默认 true） */
+    featurePopup?: boolean
+  }>(),
+  {
+    featurePopup: true,
+    fieldLabels: () => ({}),
+  },
+)
 
 /** 底图瓦片是否已配置（未配置时给出界面提示，地图本身仍可用） */
 const hasBaseMap = !!mapTileConfig.url
@@ -89,10 +112,254 @@ function initMap(): void {
     )
   }
   map.on('click', () => {
-    /* 预留：地图点击 */
+    // 同一次点击在要素上也会冒泡到地图，用时间戳避免刚弹出的属性卡被立刻关掉
+    if (Date.now() - lastFeatureClickAt < 200) return
+    closePopup()
   })
+  // 视角变化时把属性卡贴回要素位置（可见性由 syncPopupPosition 判断）
+  map.on('moving', syncPopupPosition)
+  map.on('zooming', syncPopupPosition)
+  map.on('moveend', syncPopupPosition)
+  map.on('zoomend', syncPopupPosition)
+  // 视野稳定后通知业务层按新范围取数（平移/缩放结束后各触发一次，拖拽过程中不打扰）
+  map.on('moveend', notifyViewChange)
+  map.on('zoomend', notifyViewChange)
   // 首帧布局稳定后再校正一次容器尺寸
   requestAnimationFrame(() => map?.checkSize(true))
+}
+
+/**
+ * 当前视野（经纬度包围盒 + 缩放级别）；地图未初始化时返回 null。
+ *
+ * 包围盒按 toLonLatBbox 归一化成「度」，与后端 ST_MakeEnvelope(..., 4490) 的入参一致。
+ */
+function getViewport(): MapViewport | null {
+  if (!map) return null
+  const ext = map.getExtent()
+  const { xmin, ymin, xmax, ymax } = ext ?? {}
+  if (xmin == null || ymin == null || xmax == null || ymax == null) return null
+  const zoom = map.getZoom()
+  return {
+    bbox: toLonLatBbox(xmin, ymin, xmax, ymax),
+    zoom: typeof zoom === 'number' ? zoom : props.zoom ?? 15,
+  }
+}
+
+function notifyViewChange(): void {
+  const view = getViewport()
+  if (view) props.onViewChange?.(view)
+}
+
+// ---------------- 要素属性弹窗 ----------------
+const GEOM_LABELS: Record<string, string> = { point: '点要素', line: '线要素', polygon: '面要素' }
+const STATUS_LABELS: Record<string, string> = { draft: '草稿', verified: '已核实' }
+/** 比对图层的点位/连线类型 */
+const KIND_LABELS: Record<string, string> = {
+  declared: '申报点位',
+  measured: '实测点位',
+  measure: '偏差连线',
+  point: '点位',
+}
+
+const popup = ref<PopupData | null>(null)
+/** 最近一次要素点击时间，用于区分“点要素”与“点空白” */
+let lastFeatureClickAt = 0
+
+/** 当前高亮的要素（无要素 id 的通用图层为 null） */
+let highlightedFeatureId: number | null = null
+/** 高亮记录：保存被改写的几何与原符号，关闭弹窗时还原 */
+let highlightItems: Array<{ geometry: Maptalks.Geometry; symbol: Record<string, unknown> }> = []
+
+function geometriesOf(geometry: Maptalks.Geometry): Maptalks.Geometry[] {
+  const children = (geometry as unknown as { getGeometries?: () => Maptalks.Geometry[] })
+    .getGeometries?.()
+  return children && children.length ? children : [geometry]
+}
+
+function readSymbol(geometry: Maptalks.Geometry): Record<string, unknown> {
+  const symbol = (geometry as unknown as { getSymbol?: () => Record<string, unknown> }).getSymbol?.()
+  return symbol ? { ...symbol } : {}
+}
+
+/** 高亮样式：沿用原符号做加粗/放大，避免改变要素本身的配色语义 */
+function emphasizedSymbol(
+  geometry: Maptalks.Geometry,
+  symbol: Record<string, unknown>,
+): Record<string, unknown> {
+  const type = geometry.getType()
+  if (type === 'Point' || type === 'MultiPoint') {
+    const size = Math.max(Number(symbol.markerWidth) || 12, 12) + 6
+    return { ...symbol, markerWidth: size, markerHeight: size, markerLineWidth: 3 }
+  }
+  const width = Number(symbol.lineWidth) || 2
+  if (type === 'LineString' || type === 'MultiLineString') {
+    return { ...symbol, lineWidth: width + 3 }
+  }
+  return {
+    ...symbol,
+    lineWidth: width + 1.5,
+    polygonOpacity: Math.max(Number(symbol.polygonOpacity) || 0.35, 0.5),
+  }
+}
+
+function clearHighlight(): void {
+  highlightItems.forEach(({ geometry, symbol }) => geometry.setSymbol(symbol))
+  highlightItems = []
+  highlightedFeatureId = null
+}
+
+function highlightGeometries(
+  geometries: Maptalks.Geometry[],
+  featureId: number | null = null,
+): void {
+  clearHighlight()
+  highlightedFeatureId = featureId
+  for (const geometry of geometries) {
+    for (const target of geometriesOf(geometry)) {
+      const symbol = readSymbol(target)
+      if (!Object.keys(symbol).length) continue
+      highlightItems.push({ geometry: target, symbol })
+      target.setSymbol(emphasizedSymbol(target, symbol))
+    }
+  }
+}
+
+/** 弹窗默认宽度（与 FeaturePopup 保持一致），用于边缘避让 */
+const POPUP_WIDTH = 292
+const POPUP_GAP = 12
+
+interface PopupOptions {
+  containerPoint?: { x: number; y: number }
+  lng?: number
+  lat?: number
+  accent?: string
+  title: string
+  subtitle?: string | null
+  badges?: Array<string | undefined>
+  properties?: Record<string, unknown> | null
+  labels?: Record<string, string> | null
+}
+
+/** 依据锚点像素位置计算弹窗落点与弹出方向（含边缘避让） */
+function anchorPlacement(
+  point: { x: number; y: number },
+  box: HTMLElement,
+): { x: number; y: number; placement: PopupPlacement } {
+  const width = box.clientWidth
+  const height = box.clientHeight
+  // 水平方向按弹窗宽度做边缘避让，避免贴边被裁掉
+  const half = POPUP_WIDTH / 2
+  const minX = Math.min(half + POPUP_GAP, width / 2)
+  const maxX = Math.max(width - half - POPUP_GAP, width / 2)
+  return {
+    x: Math.min(Math.max(point.x, minX), maxX),
+    y: Math.min(Math.max(point.y, POPUP_GAP), height - POPUP_GAP),
+    // 锚点靠近顶部时改为向下弹出
+    placement: point.y < 220 ? 'bottom' : 'top',
+  }
+}
+
+/** 弹窗锚点的地图坐标：视角变化后据此重新定位 */
+let popupAnchor: { lng: number; lat: number } | null = null
+
+/** 在点击位置弹出要素属性卡；无内容可展示时返回 false */
+function openPopup(options: PopupOptions): boolean {
+  if (props.featurePopup === false) return false
+  const box = mapEl.value
+  const point = options.containerPoint
+  if (!box || !point) return false
+  const rows = popupRows(options.properties, options.labels)
+  const subtitle = options.subtitle?.trim() || undefined
+  if (!rows.length && !subtitle) return false
+  if (!box.clientWidth || !box.clientHeight) return false
+
+  popupAnchor =
+    typeof options.lng === 'number' && typeof options.lat === 'number'
+      ? { lng: options.lng, lat: options.lat }
+      : null
+
+  popup.value = {
+    ...anchorPlacement(point, box),
+    accent: options.accent || '#2d6cdf',
+    title: options.title,
+    subtitle,
+    badges: (options.badges ?? []).filter((badge): badge is string => !!badge),
+    rows,
+    hint: coordHint(options.lng, options.lat),
+  }
+  return true
+}
+
+/** 平移/缩放结束后把弹窗贴回要素位置；锚点跑出可视区则收起 */
+function syncPopupPosition(): void {
+  if (!popup.value || !popupAnchor || !map || !mapEl.value) return
+  const box = mapEl.value
+  const point = map.coordinateToContainerPoint(
+    new ispace.Coordinate(popupAnchor.lng, popupAnchor.lat),
+  )
+  if (!point || !Number.isFinite(point.x) || !Number.isFinite(point.y)) {
+    closePopup()
+    return
+  }
+  const margin = 80
+  if (
+    point.x < -margin ||
+    point.y < -margin ||
+    point.x > box.clientWidth + margin ||
+    point.y > box.clientHeight + margin
+  ) {
+    closePopup()
+    return
+  }
+  popup.value = { ...popup.value, ...anchorPlacement(point, box) }
+}
+
+function closePopup(): void {
+  popup.value = null
+  popupAnchor = null
+  clearHighlight()
+}
+
+/** Esc 关闭属性卡；绘制/编辑中的 Esc 由各自工具处理，这里只在有弹窗时响应 */
+function handlePopupEscape(event: KeyboardEvent): void {
+  if (event.key !== 'Escape' || !popup.value) return
+  closePopup()
+}
+
+/** 要素点击统一入口：高亮 + 属性卡，业务回调由调用方补充 */
+function showFeaturePopup(
+  event: unknown,
+  geometry: Maptalks.Geometry,
+  options: Omit<PopupOptions, 'containerPoint' | 'lng' | 'lat'>,
+  featureId: number | null = null,
+): void {
+  // 编辑状态下点击用于插入顶点，不弹窗
+  if (editingGeometry === geometry) return
+  lastFeatureClickAt = Date.now()
+  const param = event as {
+    containerPoint?: { x: number; y: number }
+    coordinate?: { x: number; y: number }
+  }
+  const coordinate = param?.coordinate
+  // 个别引擎版本不返回 containerPoint，用点击坐标反算屏幕位置兜底
+  const containerPoint =
+    param?.containerPoint ??
+    (coordinate && map
+      ? map.coordinateToContainerPoint(new ispace.Coordinate(coordinate.x, coordinate.y))
+      : undefined)
+  const shown = openPopup({
+    ...options,
+    containerPoint,
+    lng: coordinate?.x,
+    lat: coordinate?.y,
+  })
+  if (shown) highlightGeometries([geometry], featureId)
+  else clearHighlight()
+}
+
+function statusBadge(status: unknown): string | undefined {
+  if (typeof status !== 'string' || !status) return undefined
+  return STATUS_LABELS[status] ?? status
 }
 
 // ---------------- 图层 ----------------
@@ -148,6 +415,7 @@ function renderGroups(groups: unknown[]): void {
   clearModuleLayers()
   for (const group of groups as Array<{
     module_id: number
+    module_name?: string | null
     geom_type: string
     color: string
     features: Array<{ id: number; geometry: Record<string, unknown>; properties: Record<string, unknown> }>
@@ -165,14 +433,24 @@ function renderGroups(groups: unknown[]): void {
         g.setSymbol(symbol)
         g.config('featureId', f.id)
         featureGeometries.set(f.id, g)
-        const name = (f.properties?.name as string) || ''
-        if (name) g.setInfoWindow({ title: name, content: '', autoPan: true, dx: 0, dy: 5 })
         // 未进入形状编辑前禁止拖动，避免误移图形；拖动能力由顶点编辑开启
         g.config('draggable', false)
-        const onClick = () => {
-          // 编辑状态下点击用于插入顶点，不再触发要素选中/定位
-          if (editingGeometry === g) return
-          props.onFeatureClick?.(f.id, group.module_id)
+        // 点击弹出要素属性卡（自定义弹窗），同时通知业务层选中/定位
+        const onClick = (event: unknown) => {
+          showFeaturePopup(
+            event,
+            g,
+            {
+              accent: group.color,
+              title: (f.properties?.name as string) || (f.properties?.code as string) || `要素 ${f.id}`,
+              subtitle: group.module_name,
+              badges: [GEOM_LABELS[group.geom_type], statusBadge(f.properties?.status)],
+              properties: f.properties,
+              labels: props.fieldLabels?.[group.module_id],
+            },
+            f.id,
+          )
+          if (editingGeometry !== g) props.onFeatureClick?.(f.id, group.module_id)
         }
         g.on('click', onClick)
         // 飞地（MultiPolygon）的点击事件来自子面片，需要一并绑定
@@ -182,9 +460,18 @@ function renderGroups(groups: unknown[]): void {
       }
     }
   }
+  // 图层重建后原几何已销毁：按要素 id 找回被选中的要素并还原高亮，
+  // 要素已不在当前图层里（如模块被隐藏）则收起弹窗
+  const activeId = highlightedFeatureId
+  // 通用图层（建筑物/比对）的高亮几何不随模块图层重建，保持原状
+  if (activeId === null) return
+  highlightItems = []
+  const geometry = featureGeometries.get(activeId)
+  if (geometry) highlightGeometries([geometry], activeId)
+  else closePopup()
 }
 
-/** 渲染一套通用 GeoJSON（点/线/面，带颜色与标签），用于比对页等。 */
+/** 渲染一套通用 GeoJSON（点/线/面，带颜色与标签），用于建筑物、比对页等。 */
 function renderPlain(items: Array<{
   id: string
   geometry: Record<string, unknown>
@@ -192,6 +479,12 @@ function renderPlain(items: Array<{
   label?: string
   kind?: string
   clickId?: number
+  /** 弹窗标题/副标题与属性（不传则不弹属性卡） */
+  popupTitle?: string
+  popupSubtitle?: string
+  popupBadges?: string[]
+  properties?: Record<string, unknown> | null
+  labels?: Record<string, string> | null
   onClick?: (id: string) => void
 }>, layerName = 'plain'): void {
   if (!map) return
@@ -222,8 +515,17 @@ function renderPlain(items: Array<{
             ? { lineColor: color, lineWidth: 2, lineDasharray: [6, 4] }
             : { lineColor: color, lineWidth: 2, polygonFill: color, polygonOpacity: 0.3 },
       )
-      if (item.label) g.setInfoWindow({ title: item.label, content: '' })
-      g.on('click', () => item.onClick?.(item.id))
+      g.on('click', (event: unknown) => {
+        showFeaturePopup(event, g, {
+          accent: color,
+          title: item.popupTitle || item.label || '要素信息',
+          subtitle: item.popupSubtitle ?? KIND_LABELS[item.kind ?? ''],
+          badges: item.popupBadges,
+          properties: item.properties,
+          labels: item.labels,
+        })
+        item.onClick?.(item.id)
+      })
       layer!.addGeometry(g)
     }
   }
@@ -825,6 +1127,8 @@ function startVertexEdit(
   onChange: (geojson: Record<string, unknown>) => void,
   featureId?: number | null,
 ): void {
+  // 进入编辑后原要素被隐藏，属性卡会失去锚点，先收起
+  closePopup()
   stopVertexEdit()
   if (!map) return
   const type = geometry.getType()
@@ -1006,6 +1310,7 @@ let sizeRaf = 0
 
 onMounted(() => {
   initMap()
+  document.addEventListener('keydown', handlePopupEscape)
   // 侧边栏收起/窗口尺寸变化时通知地图重算画布，避免瓦片与控制条错位
   if (mapEl.value && typeof ResizeObserver !== 'undefined') {
     sizeObserver = new ResizeObserver(() => {
@@ -1020,6 +1325,7 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  document.removeEventListener('keydown', handlePopupEscape)
   sizeObserver?.disconnect()
   sizeObserver = null
   if (sizeRaf) cancelAnimationFrame(sizeRaf)
@@ -1034,7 +1340,9 @@ onBeforeUnmount(() => {
 
 defineExpose({
   getMap: () => map,
+  getViewport,
   getModuleLayer,
+  closePopup,
   renderGroups,
   renderPlain,
   clearLayer,
@@ -1071,6 +1379,15 @@ defineExpose({
   height: 100%;
   /* 无底图时也有明确的画布底色，避免出现空白区域 */
   background: #eef1f6;
+}
+/* 要素属性卡的出现/消失：只做透明度过渡，避免与定位用的 transform 冲突 */
+.map-popup-enter-active,
+.map-popup-leave-active {
+  transition: opacity 0.16s ease;
+}
+.map-popup-enter-from,
+.map-popup-leave-to {
+  opacity: 0;
 }
 /* 底图未配置时的提示（仅提示，不影响要素绘制） */
 .map-tip {

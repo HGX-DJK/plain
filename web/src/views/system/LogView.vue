@@ -48,10 +48,12 @@ import { NIcon, NTag, type DataTableColumns } from 'naive-ui'
 import { RefreshOutline } from '@vicons/ionicons5'
 import { systemApi, type LogItem } from '@/api'
 import { toastError } from '@/utils/naive'
+import { formatDateTime } from '@/utils/time'
 
 const ACTION_LABELS: Record<string, string> = {
   login: '登录系统',
   logout: '退出登录',
+  change_password: '修改密码',
   'user:create': '新增用户',
   'user:update': '编辑用户',
   'user:delete': '删除用户',
@@ -80,6 +82,27 @@ const ACTION_LABELS: Record<string, string> = {
   'compare:run': '发起比对',
   'compare:rerun': '重新比对',
   'compare:delete': '删除比对任务',
+}
+
+/**
+ * 外景影像接口写日志时用的是裸 create/update/delete（操作对象形如 facade:3），
+ * 这里在展示层按操作对象前缀还原成 facade:* 以便显示中文；
+ * 不并入 ACTION_OPTIONS，避免筛选项与库里真实存储值不一致。
+ */
+const FACADE_ACTION_LABELS: Record<string, string> = {
+  'facade:create': '上传外景影像',
+  'facade:update': '编辑外景影像',
+  'facade:delete': '删除外景影像',
+}
+
+function effectiveAction(row: LogItem): string {
+  if (!row.action.includes(':') && (row.target || '').startsWith('facade')) return `facade:${row.action}`
+  return row.action
+}
+
+function actionLabel(row: LogItem): string {
+  const key = effectiveAction(row)
+  return ACTION_LABELS[key] ?? FACADE_ACTION_LABELS[key] ?? row.action
 }
 
 const ACTION_OPTIONS = Object.entries(ACTION_LABELS).map(([value, label]) => ({
@@ -136,8 +159,7 @@ function resetFilter() {
 }
 
 function formatTime(t?: string) {
-  if (!t) return '-'
-  return t.replace('T', ' ').slice(0, 19)
+  return formatDateTime(t)
 }
 
 function detailText(detail?: Record<string, unknown> | null) {
@@ -159,8 +181,8 @@ const columns = computed<DataTableColumns<LogItem>>(() => [
     render: (r) =>
       h(
         NTag,
-        { size: 'small', type: actionType(r.action) },
-        { default: () => ACTION_LABELS[r.action] ?? r.action },
+        { size: 'small', type: actionType(effectiveAction(r)) },
+        { default: () => actionLabel(r) },
       ),
   },
   { title: '操作对象', key: 'target', minWidth: 110, ellipsis: { tooltip: true }, render: (r) => r.target || '-' },

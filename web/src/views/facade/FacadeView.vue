@@ -283,6 +283,7 @@ import { facadeApi, type FacadeItem, type FacadeStats } from '@/api'
 import PanoramaViewer from '@/components/media/PanoramaViewer.vue'
 import { useUserStore } from '@/store/user'
 import { dialogConfirm, toastError, toastSuccess } from '@/utils/naive'
+import { formatDateTime } from '@/utils/time'
 
 const user = useUserStore()
 const can = (code: string) => user.hasPerm(code)
@@ -593,11 +594,7 @@ function fileUrl(url?: string | null): string {
 }
 
 function formatTime(value?: string | null): string {
-  if (!value) return '-'
-  const date = new Date(value)
-  if (Number.isNaN(date.getTime())) return value
-  const pad = (n: number) => String(n).padStart(2, '0')
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
+  return formatDateTime(value, false)
 }
 
 function formatSize(bytes?: number | null): string {
