@@ -1,0 +1,23 @@
+# 前端依赖不需要进镜像（dist 由本地构建后上传）
+web/node_modules
+web/.vite
+
+# Python
+.venv
+**/__pycache__
+**/*.py[cod]
+
+# 含真实数据库口令与本地路径，绝不能打进镜像
+backend/.env
+.env
+
+# 运行期数据，用挂载卷持久化
+backend/uploads
+data
+
+# 与运行无关
+.git
+.gitignore
+docs
+*.log
+docker-compose.yml

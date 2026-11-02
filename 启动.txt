@@ -1,0 +1,27 @@
+
+docker compose build
+
+docker save -o plains_base.tar plains:base
+
+
+1、导入 Docker 镜像
+
+docker load -i plains_base.tar
+
+2、后台启动容器
+
+docker compose up -d
+
+3、查看日志
+
+docker compose logs -f plains
+
+
+4、初始化数据库（仅首次部署空库需要）
+
+docker compose exec plains python scripts/init_db.py
+
+该脚本会自动开启 PostGIS 扩展、创建所有数据表，并创建默认初始管理员账号：
+
+账号：admin
+密码：Admin@123

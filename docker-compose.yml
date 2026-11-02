@@ -1,0 +1,68 @@
+# ============================================================
+# 外挂部署模式：代码外挂（前后端代码不打入镜像）
+#   docker compose up -d
+# 
+# 路径配置说明：
+#   外挂的宿主机路径由根目录的 .env 文件统一配置，也支持在下方使用默认值：
+#   - HOST_BACKEND_PATH  : 后端源码目录（默认 ./backend）
+#   - HOST_WEB_DIST_PATH : 前端构建产物目录（默认 ./web/dist）
+#   - HOST_UPLOAD_PATH   : 上传持久化目录（默认 ./data/uploads）
+#   - HOST_PORT          : 宿主机对外映射端口（默认 8100）
+#
+# 优势：
+#   1. 镜像仅作为 Python 运行环境（含依赖），前后端代码全部由宿主机挂载进容器；
+#   2. 后端代码修改后，无需重新构建镜像，执行 docker compose restart plains 即生效；
+#   3. 前端重新执行 npm run build 生成 dist 后，直接刷新浏览器即生效。
+#
+# 数据库配置见 backend/.env 的 PG_*
+# 注意：容器内的 127.0.0.1 指容器自身；若数据库在宿主机，
+#       PG_HOST 填 host.docker.internal（已配置 extra_hosts 支持 Linux/Win/Mac）或宿主机内网 IP。
+# ============================================================
+
+services:
+  plains:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: plains:base
+    container_name: plains
+    restart: unless-stopped
+    ports:
+      - "${HOST_PORT:-8100}:8100"
+    # 支持在 Linux/Win/Mac 下使用 host.docker.internal 访问宿主机服务（如宿主机数据库）
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # 加载环境变量：根目录 .env 配置外挂路径，backend/.env 配置后端参数
+    env_file:
+      - .env
+      - backend/.env
+    environment:
+      APP_HOST: 0.0.0.0
+      APP_PORT: "8100"
+      WEB_DIST: /app/web/dist
+      UPLOAD_DIR: /app/backend/uploads
+    volumes:
+      # 1. 后端代码外挂：默认 ./backend -> 容器 /app/backend
+      - ${HOST_BACKEND_PATH:-./backend}:/app/backend
+      # 2. 前端静态产物外挂：默认 ./web/dist -> 容器 /app/web/dist
+      - ${HOST_WEB_DIST_PATH:-./web/dist}:/app/web/dist
+      # 3. 外景影像等上传文件持久化：默认 ./data/uploads -> 容器 /app/backend/uploads
+      - ${HOST_UPLOAD_PATH:-./data/uploads}:/app/backend/uploads
+    # 可选开发模式：如需后端代码保存时自动热重载（无需手动 restart），可取消下行注释
+    # command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8100", "--reload"]
+
+  # ---- 可选：数据库也放进容器（默认注释，使用外部库时不要启用）----
+  # db:
+  #   image: postgis/postgis:16-3.4
+  #   container_name: plains-db
+  #   restart: unless-stopped
+  #   environment:
+  #     POSTGRES_DB: plains
+  #     POSTGRES_USER: postgres
+  #     POSTGRES_PASSWORD: change-me
+  #     TZ: Asia/Shanghai
+  #   ports:
+  #     - "5432:5432"
+  #   volumes:
+  #     - ./data/pgdata:/var/lib/postgresql/data
+  #   启用后 backend/.env 中 PG_HOST 改为 db

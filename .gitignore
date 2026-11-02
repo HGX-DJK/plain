@@ -1,0 +1,23 @@
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.log
+
+# 环境变量含真实数据库口令与本地路径，不入库
+backend/.env
+.env
+
+# 外景影像等上传文件
+backend/uploads/
+
+# node
+web/node_modules/
+web/dist/
+web/.vite/
+
+# 编辑器
+.idea/
+.vscode/
+.DS_Store
